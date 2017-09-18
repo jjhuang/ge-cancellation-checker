@@ -8,6 +8,7 @@ import json
 import logging
 import smtplib
 import sys
+import time
 
 from datetime import datetime
 from os import path
@@ -22,7 +23,7 @@ EMAIL_TEMPLATE = """
 """
 
 
-def notify_send_email(settings, current_apt, avail_apt, use_gmail=False):
+def notify_send_email(settings, old_apt, avail_apt, use_gmail=False):
     sender = settings.get('email_from')
     recipient = settings.get('email_to', sender)  # If recipient isn't provided, send to self.
 
@@ -51,7 +52,7 @@ def notify_send_email(settings, current_apt, avail_apt, use_gmail=False):
                                "to: %s" % recipient,
                                "mime-version: 1.0",
                                "content-type: text/html"])
-        message = EMAIL_TEMPLATE % (avail_apt.strftime('%B %d, %Y'), current_apt.strftime('%B %d, %Y'))
+        message = EMAIL_TEMPLATE % (avail_apt.strftime('%B %d, %Y'), old_apt.strftime('%B %d, %Y'))
         content = headers + "\r\n\r\n" + message
 
         server.sendmail(sender, recipient, content)
@@ -91,6 +92,9 @@ def notify_sms(settings, avail_apt):
 
 
 def main(settings):
+    ts_format = '%B %d, %Y'
+    old_apt = settings['current_interview_date_str']
+
     try:
         # Run the phantom JS script - output will be formatted like 'July 20, 2015'
         # script_output = check_output(['phantomjs', '%s/ge-cancellation-checker.phantom.js' % pwd]).strip()
@@ -101,31 +105,47 @@ def main(settings):
             logging.critical('Cannot find phantomjs. Make sure it is in your path.')
             return
 
-        script_output = check_output([cmd, '--ssl-protocol=any', '%s/ge-cancellation-checker.phantom.js' % pwd, '--config', settings.get('configfile')]).strip()
-        
-        if script_output == 'None':
-            logging.info('No appointments available.')
-            return
+        first_time = True
+        while first_time or settings.get('retry'):
+            first_time = False
+            logging.info('Checking...')
+            new_apt = check_output([cmd, '--ssl-protocol=any', '%s/ge-cancellation-checker.phantom.js' % pwd, '--config', settings.get('configfile')]).strip()
 
-        new_apt = datetime.strptime(script_output, '%B %d, %Y')
-    except ValueError:
-        logging.critical("Couldn't convert output: {} from phantomJS script into a valid date. ".format(script_output))
+            if not new_apt or new_apt == 'None':
+                logging.info('No appointments available.')
+                if not settings.get('retry'):
+                    break
+                logging.info('Sleeping for %d seconds...' % settings.get('retry'))
+                time.sleep(settings.get('retry'))
+                continue
+
+            new_ts = datetime.strptime(new_apt, ts_format)
+            old_ts = datetime.strptime(old_apt, ts_format)
+
+            if (old_ts - new_ts).days < settings['threshold']:
+                logging.info('Appointment found on %s, but below threshold' % new_apt)
+                logging.info('Sleeping for %d seconds...' % settings.get('retry'))
+                time.sleep(settings.get('retry'))
+            else:
+                break
+
+    except ValueError, e:
+        logging.critical("Couldn't convert output: {} from phantomJS script into a valid date. ".format(new_ts))
         return
     except OSError:
         logging.critical("Something went wrong when trying to run ge-cancellation-checker.phantom.js. Is phantomjs is installed?")
         return
 
-    current_apt = datetime.strptime(settings['current_interview_date_str'], '%B %d, %Y')
-    if new_apt > current_apt:
-        logging.info('No new appointments. Next available in location %s on %s (current is on %s)' % (settings.get("enrollment_location_id"), new_apt, current_apt))
+    if datetime.strptime(new_apt, ts_format) > datetime.strptime(old_apt, ts_format):
+        logging.info('No new appointments. Next available in location %s on %s (current is on %s)' % (settings.get("enrollment_location_id"), new_apt, old_apt))
     else:
-        msg = 'Found new appointment in location %s on %s (current is on %s)!' % (settings.get("enrollment_location_id"), new_apt, current_apt)
+        msg = 'Found new appointment in location %s on %s (current is on %s)!' % (settings.get("enrollment_location_id"), new_apt, old_apt)
         logging.info(msg + (' Sending email.' if not settings.get('no_email') else ' Not sending email.'))
 
         if settings.get('notify_osx'):
             notify_osx(msg)
         if not settings.get('no_email'):
-            notify_send_email(settings, current_apt, new_apt, use_gmail=settings.get('use_gmail'))
+            notify_send_email(settings, old_apt, new_apt, use_gmail=settings.get('use_gmail'))
         if settings.get('twilio_account_sid'):
             notify_sms(settings, new_apt)
 
@@ -167,6 +187,8 @@ if __name__ == '__main__':
     parser.add_argument('--use-gmail', action='store_true', dest='use_gmail', default=False, help='Use the gmail SMTP server instead of sendmail.')
     parser.add_argument('--notify-osx', action='store_true', dest='notify_osx', default=False, help='If better date is found, notify on the osx desktop.')
     parser.add_argument('--config', dest='configfile', default='%s/config.json' % pwd, help='Config file to use (default is config.json)')
+    parser.add_argument('--retry', type=int, default=0, help='Retry after X seconds')
+    parser.add_argument('--threshold', type=int, default=0, help='Days to trigger threshold')
     arguments = vars(parser.parse_args())
     logging.info("config file is:" + arguments['configfile'])
     # Load Settings
@@ -178,7 +200,7 @@ if __name__ == '__main__':
             for key, val in arguments.iteritems():
                 if not arguments.get(key): continue
                 settings[key] = val
-            
+
             settings['configfile'] = arguments['configfile']
             _check_settings(settings)
     except Exception as e:
